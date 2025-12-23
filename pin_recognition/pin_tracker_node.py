@@ -19,23 +19,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def tilt_deg_from_v(vx: float, vy: float) -> float:
-    """
-    fitLineの方向ベクトル(vx, vy)が「垂直から何度傾いているか」を返す。
-    0deg=完全垂直、90deg=完全水平
-    """
-    ang = abs(np.degrees(np.arctan2(vy, vx)))  # 0..180
-    return abs(90.0 - ang)
-
-
 def rect_upright_tilt_deg(rect) -> float:
     """
-    minAreaRect の angle から「垂直からの傾き」を概算（0=垂直）。
-    OpenCVの角度表現は癖があるので、ここで“垂直との差”に正規化する。
+    minAreaRect の angle から「垂直からの傾き」を概算（0=垂直, 90=水平）。
     """
     (_, _), (w, h), angle = rect
-
-    # rectの定義により w<h のとき angleが入れ替わることがあるので正規化
     if w < h:
         w, h = h, w
         angle = angle + 90.0
@@ -47,49 +35,81 @@ def rect_upright_tilt_deg(rect) -> float:
     return abs(90.0 - a)
 
 
-class WhiteFollowerNode(Node):
+def tilt_deg_pca(xs: np.ndarray, ys: np.ndarray) -> float:
     """
-    できるだけ単純：
-      - 固定しきい値で白を2値化
-      - 白の最大連結成分だけ見る
-      - 直立性（倒れてない）を判定
-      - 検出できたら重心に向けて旋回しながら前進
+    PCA主軸の向きから「垂直から何度傾いているか」を返す（0=垂直, 90=水平）。
+    fitLineより安定しやすい。
+    """
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    if pts.shape[0] < 2:
+        return 90.0
+    _, eigvec = cv2.PCACompute(pts, mean=None)
+    vx, vy = float(eigvec[0, 0]), float(eigvec[0, 1])
+    ang = abs(np.degrees(np.arctan2(vy, vx)))  # 0..180
+    return abs(90.0 - ang)
+
+
+def horiz_dev_deg_from_tilt(tilt_from_vertical: float) -> float:
+    """
+    tilt(0=垂直,90=水平) から「水平(90)からのズレ角」を返す。
+    0deg=完全水平、90deg=完全垂直
+    """
+    return abs(90.0 - float(tilt_from_vertical))
+
+
+class RedLineFollowerNode(Node):
+    """
+    赤線（テープ/線）を主ターゲットとして追跡する（横線版）。
+    - 赤マスクから連結成分を取り、縦横比と傾きで「横の赤線」だけ採用
+    - 採用成分の重心cxで旋回制御
     """
 
     def __init__(self):
-        super().__init__("white_follower_node")
+        super().__init__("red_line_follower_node")
 
         # -------------------------
         # Params
         # -------------------------
         self.declare_parameter("image_topic", "/image")
-        self.declare_parameter("show_windows", False)
+        self.declare_parameter("show_windows", True)
         self.declare_parameter("publish_annotated", True)
-        self.declare_parameter("publish_debug_mask", False)
 
-        # white detect (FIXED threshold)
-        self.declare_parameter("white_fixed_threshold", 40)   # ←ゆるめ固定しきい値（30〜60で調整）
-        self.declare_parameter("min_white_pixels", 400)        # 小さいノイズ除外
+        # debug
+        self.declare_parameter("publish_red_mask", True)
 
-        self.declare_parameter("morph_open_iters", 0)          # ノイズ多いなら1
-        self.declare_parameter("morph_close_iters", 1)         # 穴埋め 1〜2
+        # red hsv
+        self.declare_parameter("red_s_min", 120)
+        self.declare_parameter("red_v_min", 90)
 
-        # upright gate (倒れている白を弾く)
-        self.declare_parameter("upright_min_points", 80)
-        self.declare_parameter("upright_aspect_min_far", 2.2)  # 遠いとき（細長く見えるはず）
-        self.declare_parameter("upright_aspect_min_near", 0.5) # 近いとき（画角で崩れるので緩める）
-        self.declare_parameter("upright_tilt_max_far", 25.0)   # 垂直からの許容角（小さいほど厳しい）
-        self.declare_parameter("upright_tilt_max_near", 35.0)
+        # red morph
+        self.declare_parameter("red_close_iters", 2)
+        self.declare_parameter("red_open_iters", 0)
 
-        self.declare_parameter("near_major_ratio", 0.55)       # 近距離判定：major >= 0.55*H
-        self.declare_parameter("near_area_ratio", 0.08)        # 近距離判定：area >= 0.08*HW
+        # detection gate
+        self.declare_parameter("min_red_pixels", 50)          # ノイズ除外
+        self.declare_parameter("min_points", 60)
+
+        # 線の細長さ（横でも縦でも「細長さ」なので共通）
+        self.declare_parameter("aspect_min_far", 2.0)         # 遠いとき細長い
+        self.declare_parameter("aspect_min_near", 1.2)        # 近いとき崩れるので緩め
+
+        # ★横線ゲート：水平からの許容角（0=水平）
+        self.declare_parameter("tilt_max_far", 15.0)          # 遠いとき厳しめ
+        self.declare_parameter("tilt_max_near", 25.0)         # 近いとき緩め
+
+        # near判定
+        self.declare_parameter("near_major_ratio", 0.45)      # major >= 0.45*H なら近い扱い
+        self.declare_parameter("near_area_ratio", 0.02)       # area >= 0.02*HW なら近い扱い
+
+        # ★横長bbox条件（誤検出低減）
+        self.declare_parameter("use_bbox_aspect_gate", True)
+        self.declare_parameter("bbox_aspect_w_min", 1.2)      # w/h >= 1.2 を要求（横長）
 
         # control
         self.declare_parameter("angular_gain", 1.5)
         self.declare_parameter("max_angular_speed", 0.4)
         self.declare_parameter("linear_speed", 1.0)
-        self.declare_parameter("search_yaw_rate", 0.3)         # 見失った時（0なら停止）
-        self.calib = True
+        self.declare_parameter("search_yaw_rate", 0.3)
 
         # -------------------------
         # Read params
@@ -97,31 +117,32 @@ class WhiteFollowerNode(Node):
         self.image_topic = self.get_parameter("image_topic").value
         self.show_windows = bool(self.get_parameter("show_windows").value)
         self.publish_annotated = bool(self.get_parameter("publish_annotated").value)
-        self.publish_debug_mask = bool(self.get_parameter("publish_debug_mask").value)
 
-        self.white_fixed_threshold = int(self.get_parameter("white_fixed_threshold").value)
-        self.min_white_pixels = int(self.get_parameter("min_white_pixels").value)
+        self.publish_red_mask = bool(self.get_parameter("publish_red_mask").value)
 
-        self.morph_open_iters = int(self.get_parameter("morph_open_iters").value)
-        self.morph_close_iters = int(self.get_parameter("morph_close_iters").value)
+        self.red_s_min = int(self.get_parameter("red_s_min").value)
+        self.red_v_min = int(self.get_parameter("red_v_min").value)
+        self.red_close_iters = int(self.get_parameter("red_close_iters").value)
+        self.red_open_iters = int(self.get_parameter("red_open_iters").value)
 
-        self.upright_min_points = int(self.get_parameter("upright_min_points").value)
-        self.upright_aspect_min_far = float(self.get_parameter("upright_aspect_min_far").value)
-        self.upright_aspect_min_near = float(self.get_parameter("upright_aspect_min_near").value)
-        self.upright_tilt_max_far = float(self.get_parameter("upright_tilt_max_far").value)
-        self.upright_tilt_max_near = float(self.get_parameter("upright_tilt_max_near").value)
+        self.min_red_pixels = int(self.get_parameter("min_red_pixels").value)
+        self.min_points = int(self.get_parameter("min_points").value)
+
+        self.aspect_min_far = float(self.get_parameter("aspect_min_far").value)
+        self.aspect_min_near = float(self.get_parameter("aspect_min_near").value)
+        self.tilt_max_far = float(self.get_parameter("tilt_max_far").value)
+        self.tilt_max_near = float(self.get_parameter("tilt_max_near").value)
 
         self.near_major_ratio = float(self.get_parameter("near_major_ratio").value)
         self.near_area_ratio = float(self.get_parameter("near_area_ratio").value)
+
+        self.use_bbox_aspect_gate = bool(self.get_parameter("use_bbox_aspect_gate").value)
+        self.bbox_aspect_w_min = float(self.get_parameter("bbox_aspect_w_min").value)
 
         self.angular_gain = float(self.get_parameter("angular_gain").value)
         self.max_angular_speed = float(self.get_parameter("max_angular_speed").value)
         self.linear_speed = float(self.get_parameter("linear_speed").value)
         self.search_yaw_rate = float(self.get_parameter("search_yaw_rate").value)
-
-        self.declare_parameter("keep_straight_duration", 3.0) # 何秒間直進し続けるか
-        self.keep_straight_duration = self.get_parameter("keep_straight_duration").value
-        self.last_detected_time = 0.0 # 最後に認識した時刻（ROSの時刻）
 
         # -------------------------
         # ROS I/O
@@ -140,90 +161,121 @@ class WhiteFollowerNode(Node):
         self.timer = self.create_timer(0.1, self.timer_callback)  # 10Hz
 
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 1)
-        self.annotated_pub = self.create_publisher(Image, "/white_follower/annotated", 1)
-        self.detected_pub = self.create_publisher(Bool, "/white_follower/detected", 1)
-        self.mask_pub = self.create_publisher(Image, "/white_follower/white_mask", 1)
+        self.annotated_pub = self.create_publisher(Image, "/red_line_follower/annotated", 1)
+        self.detected_pub = self.create_publisher(Bool, "/red_line_follower/detected", 1)
+        self.red_pub = self.create_publisher(Image, "/red_line_follower/red_mask", 1)
 
         self.get_logger().info(
-            f"white_follower_node started. image_topic={self.image_topic} "
-            f"thr_fixed={self.white_fixed_threshold} min_white_pixels={self.min_white_pixels}"
+            "red_line_follower_node(HORIZONTAL) started. "
+            f"image_topic={self.image_topic} red_s_min={self.red_s_min} red_v_min={self.red_v_min} "
+            f"min_red_pixels={self.min_red_pixels}"
         )
 
     # -------------------------
-    # White mask (FIXED threshold)
+    # Red mask (HSV, wrap)
     # -------------------------
-    def make_white_mask(self, bgr: np.ndarray):
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    def make_red_mask(self, bgr: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        smin = int(self.red_s_min)
+        vmin = int(self.red_v_min)
 
-        # 固定しきい値（値を下げるほど“ゆるい”）
-        t = 130
-        _, bw = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY)
+        lower1 = np.array([0, smin, vmin], dtype=np.uint8)
+        upper1 = np.array([10, 255, 255], dtype=np.uint8)
+        lower2 = np.array([170, smin, vmin], dtype=np.uint8)
+        upper2 = np.array([179, 255, 255], dtype=np.uint8)
 
-        # 形態学（任意）
+        m1 = cv2.inRange(hsv, lower1, upper1)
+        m2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(m1, m2)
+
         k3 = np.ones((3, 3), np.uint8)
-        if self.morph_open_iters > 0:
-            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k3, iterations=self.morph_open_iters)
-        if self.morph_close_iters > 0:
-            bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k3, iterations=self.morph_close_iters)
+        if self.red_open_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=self.red_open_iters)
+        if self.red_close_iters > 0:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3, iterations=self.red_close_iters)
 
-        return bw, t
+        return mask
 
     # -------------------------
-    # Upright white detection (largest CC)
+    # Detect horizontal red component
     # -------------------------
-    def detect_upright_white(self, bw: np.ndarray, H: int, W: int):
+    def detect_horizontal_red(self, red_mask: np.ndarray, H: int, W: int):
         """
-        白を検出するが、倒れている（水平に近い）白塊は弾く。
-        戻り値: (detected:bool, cx:int|None, cy:int|None, debug:str)
+        赤マスクの連結成分から「横っぽい赤線」を1つ選ぶ。
+        戻り値: (detected, cx, cy, bbox, dbg)
         """
-
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(red_mask, connectivity=8)
         if n <= 1:
-            return False, None, None, "no_cc"
+            return False, None, None, None, "no_cc"
 
-        best_i = -1
-        best_area = -1
+        best = None
+        best_score = -1.0
+
         for i in range(1, n):
             area = int(stats[i, cv2.CC_STAT_AREA])
-            if area > best_area:
-                best_area = area
-                best_i = i
+            if area < self.min_red_pixels:
+                continue
 
-        if best_i < 0 or best_area < self.min_white_pixels:
-            return False, None, None, "too_small"
+            comp = (labels == i)
+            ys, xs = np.where(comp)
+            if ys.size < self.min_points:
+                continue
 
-        comp = (labels == best_i)
-        ys, xs = np.where(comp)
-        if ys.size < self.upright_min_points:
-            return False, None, None, "few_pts"
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            bbox = (x, y, w, h)
 
-        pts = np.column_stack([xs, ys]).astype(np.float32)
+            # 横長bbox条件（任意だが強い）
+            if self.use_bbox_aspect_gate:
+                bbox_aspect_w = w / max(1, h)  # 横長ほど大きい
+                if bbox_aspect_w < self.bbox_aspect_w_min:
+                    continue
 
-        rect = cv2.minAreaRect(pts)
-        (_, _), (rw, rh), _ = rect
-        major = float(max(rw, rh))
-        minor = float(max(1.0, min(rw, rh)))
-        aspect = major / minor
+            # minAreaRectで細長さ & 傾き
+            pts = np.column_stack([xs, ys]).astype(np.float32)
+            rect = cv2.minAreaRect(pts)
+            (_, _), (rw, rh), _ = rect
+            major = float(max(rw, rh))
+            minor = float(max(1.0, min(rw, rh)))
+            aspect = major / minor
 
-        tilt_rect = rect_upright_tilt_deg(rect)
+            # 0=垂直, 90=水平
+            tilt_r_v = rect_upright_tilt_deg(rect)
+            tilt_p_v = tilt_deg_pca(xs, ys)
 
-        is_near = (major >= self.near_major_ratio * H) or (best_area >= self.near_area_ratio * (H * W))
-        aspect_min = self.upright_aspect_min_near if is_near else self.upright_aspect_min_far
-        tilt_max = self.upright_tilt_max_near if is_near else self.upright_tilt_max_far
+            # 0=水平（水平からのズレ）
+            dev_r_h = horiz_dev_deg_from_tilt(tilt_r_v)
+            dev_p_h = horiz_dev_deg_from_tilt(tilt_p_v)
 
-        if aspect < aspect_min:
-            return False, None, None, f"aspect_ng({aspect:.2f}<{aspect_min})"
-        if tilt_rect > tilt_max:
-            return False, None, None, f"tilt_ng({tilt_rect:.1f}>{tilt_max})"
+            # near判定
+            is_near = (major >= self.near_major_ratio * H) or (area >= self.near_area_ratio * (H * W))
+            aspect_min = self.aspect_min_near if is_near else self.aspect_min_far
+            dev_max = self.tilt_max_near if is_near else self.tilt_max_far
 
-        vx, vy, _, _ = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
-        tilt_fit = float(tilt_deg_from_v(float(vx), float(vy)))
-        if tilt_fit > tilt_max:
-            return False, None, None, f"tiltfit_ng({tilt_fit:.1f}>{tilt_max})"
+            # 細長さ + 水平度でフィルタ
+            if aspect < aspect_min:
+                continue
+            if dev_r_h > dev_max:
+                continue
+            if dev_p_h > dev_max:
+                continue
 
-        cx = int(np.mean(xs))
-        cy = int(np.mean(ys))
-        return True, cx, cy, f"ok asp={aspect:.2f} tiltR={tilt_rect:.1f} tiltF={tilt_fit:.1f}"
+            # スコア：大きい&細長いを優先
+            score = area * aspect
+            if score > best_score:
+                best_score = score
+                cx = int(np.mean(xs))
+                cy = int(np.mean(ys))
+                best = (cx, cy, bbox, area, aspect, dev_r_h, dev_p_h, is_near)
+
+        if best is None:
+            return False, None, None, None, "no_horizontal_red"
+
+        cx, cy, bbox, area, aspect, dev_r_h, dev_p_h, is_near = best
+        dbg = f"ok area={area} asp={aspect:.2f} devH_R={dev_r_h:.1f} devH_P={dev_p_h:.1f} near={int(is_near)}"
+        return True, cx, cy, bbox, dbg
 
     # -------------------------
     # ROS callback
@@ -250,38 +302,53 @@ class WhiteFollowerNode(Node):
 
         H, W = self.bgr.shape[:2]
 
-        bw, thr = self.make_white_mask(self.bgr)
-        detected, cx, cy, dbg = self.detect_upright_white(bw, H, W)
+        # 1) 赤マスク
+        red_mask = self.make_red_mask(self.bgr)
 
+        # 2) 横赤検出
+        detected, cx, cy, bbox, dbg = self.detect_horizontal_red(red_mask, H, W)
+
+        # publish detected flag
         self.detected_pub.publish(Bool(data=bool(detected)))
 
-        # publish mask (optional)
-        if self.publish_debug_mask and self.header is not None:
+        # publish red mask (optional)
+        if self.publish_red_mask and self.header is not None:
             try:
-                m = self.bridge.cv2_to_imgmsg(bw, encoding="mono8")
-                m.header = self.header
-                self.mask_pub.publish(m)
+                rm = self.bridge.cv2_to_imgmsg(red_mask, encoding="mono8")
+                rm.header = self.header
+                self.red_pub.publish(rm)
             except Exception:
                 pass
 
+        # annotated
         annotated = self.bgr.copy()
         cv2.line(annotated, (W // 2, 0), (W // 2, H), (255, 0, 0), 1)
 
         if detected and cx is not None and cy is not None:
             cv2.circle(annotated, (cx, cy), 8, (0, 255, 0), -1)
+            if bbox is not None:
+                x, y, w, h = bbox
+                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 255), 2)
             cv2.putText(
                 annotated,
-                f"WHITE UPRIGHT thr={thr} {dbg} cx={cx}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2
+                f"TRACK RED(H) {dbg} cx={cx}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 255, 255),
+                2,
             )
         else:
             cv2.putText(
                 annotated,
-                f"SEARCH thr={thr} {dbg}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 180, 255), 2
+                f"SEARCH RED(H) {dbg}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 180, 255),
+                2,
             )
 
-        # publish annotated
         if self.publish_annotated and self.header is not None:
             try:
                 out = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
@@ -290,67 +357,33 @@ class WhiteFollowerNode(Node):
             except Exception:
                 pass
 
-        # local view
         if self.show_windows:
             try:
-                cv2.imshow("white_follower_annotated", annotated)
-                cv2.imshow("white_mask", bw)
+                cv2.imshow("red_line_follower_annotated", annotated)
+                cv2.imshow("red_mask", red_mask)
                 cv2.waitKey(1)
             except Exception:
                 pass
 
+        # -------------------------
         # control
-        now_sec = self.get_clock().now().nanoseconds / 1e9  # 現在時刻(秒)
-
-        # ターゲットを認識できた場合、時刻を更新
-        if detected and cx is not None:
-            self.last_detected_time = now_sec
-
-        # 「直進を維持する時間内」かどうかを判定
-        is_searching = (now_sec - self.last_detected_time) > self.keep_straight_duration
-        
+        # -------------------------
         twist = Twist()
-
-        if is_searching:
-            # 【探索モード】5秒以上見つからないので、止まって旋回
+        if not detected or cx is None:
             twist.linear.x = 0.0
             twist.angular.z = float(self.search_yaw_rate)
-            self.calib = True
         else:
-            # 【直進・追従モード】見つけてから5秒以内
-            if self.calib and detected:
-                # 最初に発見した瞬間だけのキャリブレーション動作
-                twist.linear.x = 0.0
-                twist.angular.z = -1.0 * float(self.search_yaw_rate)
-                self.calib = False
-            else:
-                # ★ここがメインの直進★
-                # 見えていれば cx で計算できるが、見失っていても linear.x を出す
-                twist.linear.x = float(self.linear_speed)
-                twist.angular.z = 0.0
-
-#        if not detected or cx is None and not is_keep_straight:
-#           twist.linear.x = 0.0
-#            twist.angular.z = float(self.search_yaw_rate)
-#            self.calib = True
-#        else:
- #           if self.calib is True:
-  #              twist.linear.x = 0.0
-   #             twist.angular.z = -1.0*float(self.search_yaw_rate)
-    #            self.calib = False
-     #       else:
-      #          err = (float(cx) - (W / 2.0)) / (W / 2.0)  # -1..1
-       #         wz = -self.angular_gain * err
-                #twist.angular.z = float(clamp(wz, -self.max_angular_speed, self.max_angular_speed))
-        #        twist.angular.z = 0.0
-         #       twist.linear.x = float(self.linear_speed)
+            err = (float(cx) - (W / 2.0)) / (W / 2.0)  # -1..1
+            wz = -self.angular_gain * err
+            twist.angular.z = float(clamp(wz, -self.max_angular_speed, self.max_angular_speed))
+            twist.linear.x = float(self.linear_speed)
 
         self.cmd_pub.publish(twist)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = WhiteFollowerNode()
+    node = RedLineFollowerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -367,4 +400,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
